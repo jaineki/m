@@ -1,0 +1,1783 @@
+// src/pages/WatchHtmlPage.jsx
+import React, { useEffect, useState, useContext, useCallback, useMemo, useRef } from "react";
+import VideoPlayer from "./VideoPlayer";
+import { useParams, useNavigate, Link, useLocation } from "react-router-dom";
+import { supabase } from "../utils/supabaseClient";
+import { saveProgress, getResumeTime, readOne, readContinueList, removeProgress, progressPercent, timeLeft, hasNextEpisode } from "../utils/continueWatching";
+import Navbar from "../components/Navbar";
+import { AppContext } from "../context/AppContext";
+import axios from "axios";
+import MbidadmBanner from "../components/MbidadmBanner";
+import { parseFileMeta, fileNameOf } from "../utils/fileMeta";
+import {
+  Loader2, Star, Play, ShieldCheck,
+  ArrowLeft, List, MonitorPlay,
+  Video, Zap, Database, Clock, Globe, AlertCircle,
+  ChevronDown, Monitor, Cpu, Download, X, Languages,
+  Settings, Eye, Film, Tv2,
+  Shield, Signal, Users
+} from "lucide-react";
+
+/* ===== Safe URI ===== */
+const safeURI = (uri) => {
+  if (!uri) return "";
+  try { return encodeURI(decodeURI(uri)); } catch { return uri; }
+};
+
+/* ===== Slug ===== */
+const generateSlug = (title) =>
+  title?.toLowerCase().trim()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "";
+
+/* ===== Detect content type robustly from a state/payload object ===== */
+// Priority: explicit content_type field → TV-specific TMDB fields → fallback movie
+const detectStateContentType = (s) => {
+  if (s.content_type === "tv")    return "tv";
+  if (s.content_type === "movie") return "movie";
+  // TMDB TV items carry first_air_date; movies carry release_date
+  if (s.first_air_date)           return "tv";
+  // If episodes array is non-empty it must be a series
+  if (Array.isArray(s.episodes) && s.episodes.length > 0) return "tv";
+  return "movie";
+};
+
+/* ===== Group episodes by season ===== */
+const groupEpisodesBySeason = (episodes) => {
+  if (!Array.isArray(episodes) || episodes.length === 0) return {};
+  return episodes.reduce((acc, ep, globalIndex) => {
+    const sNum = ep?.season ? Number(ep.season) : (ep.season_number || 1);
+    const key  = `S${sNum}`;
+    if (!acc[key]) acc[key] = { name: `Season ${sNum}`, episodes: [], counter: 0 };
+    acc[key].counter += 1;
+    acc[key].episodes.push({
+      ...ep,
+      season: sNum,
+      globalIndex,
+      episodeNumberInSeason: ep.episodeNumberInSeason || ep.episode || ep.episode_number || acc[key].counter,
+    });
+    return acc;
+  }, {});
+};
+
+/* ===== Toggle ===== */
+const Toggle = ({ checked, onChange }) => (
+  <button
+    onClick={() => onChange(!checked)}
+    aria-pressed={checked}
+    className={`relative inline-flex h-7 w-12 sm:h-6 sm:w-11 items-center rounded-full transition-all duration-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 touch-manipulation
+      ${checked ? "bg-blue-500 shadow-[0_0_12px_rgba(59,130,246,0.5)]" : "bg-gray-800 border border-white/10"}`}
+  >
+    <span className={`inline-block h-5 w-5 sm:h-4 sm:w-4 transform rounded-full shadow-md transition-all duration-300
+      ${checked ? "translate-x-6 bg-white" : "translate-x-1 bg-gray-500"}`} />
+  </button>
+);
+
+/* ===== Server Badge ===== */
+const COLOR = {
+  imdb_reader: { glow:"rgba(234,179,8,0.3)",  bg:"from-yellow-500/10 to-yellow-600/5", border:"border-yellow-500/30", text:"text-yellow-400", dot:"bg-yellow-400" },
+  embed:       { glow:"rgba(99,102,241,0.3)",  bg:"from-indigo-500/10 to-indigo-600/5", border:"border-indigo-500/30", text:"text-indigo-400", dot:"bg-indigo-400" },
+  mirchi:      { glow:"rgba(244,63,94,0.3)",   bg:"from-rose-500/10 to-rose-600/5",     border:"border-rose-500/30",   text:"text-rose-400",   dot:"bg-rose-400"   },
+  vidify:      { glow:"rgba(168,85,247,0.3)",  bg:"from-purple-500/10 to-purple-600/5", border:"border-purple-500/30", text:"text-purple-400", dot:"bg-purple-400" },
+  videasy:     { glow:"rgba(59,130,246,0.3)",  bg:"from-blue-500/10 to-blue-600/5",   border:"border-blue-500/30",   text:"text-blue-400",   dot:"bg-blue-400"   },
+  vidup:       { glow:"rgba(6,182,212,0.3)",   bg:"from-cyan-500/10 to-cyan-600/5",    border:"border-cyan-500/30",   text:"text-cyan-400",   dot:"bg-cyan-400"   },
+  tmdb:        { glow:"rgba(59,130,246,0.3)",  bg:"from-blue-500/10 to-blue-600/5",   border:"border-blue-500/30",   text:"text-blue-400",   dot:"bg-blue-400"   },
+  "2embed":    { glow:"rgba(249,115,22,0.3)",  bg:"from-orange-500/10 to-orange-600/5",border:"border-orange-500/30",text:"text-orange-400", dot:"bg-orange-400" },
+  modiplay:    { glow:"rgba(236,72,153,0.3)",  bg:"from-pink-500/10 to-pink-600/5",    border:"border-pink-500/30",   text:"text-pink-400",   dot:"bg-pink-400"   },
+  hls:         { glow:"rgba(34,197,94,0.3)",   bg:"from-green-500/10 to-green-600/5",  border:"border-green-500/30",  text:"text-green-400",  dot:"bg-green-400"  },
+};
+
+const ServerBadge = ({ server, isActive, onClick, compact = false }) => {
+  const c = COLOR[server.id] || COLOR.videasy;
+  if (compact) return (
+    <button onClick={onClick}
+      className={`relative flex items-center gap-2 px-3.5 py-2.5 sm:px-3 sm:py-2 rounded-lg text-xs font-bold uppercase tracking-wider
+        transition-all duration-200 border min-h-[44px] touch-manipulation active:scale-95
+        ${isActive ? `bg-gradient-to-br ${c.bg} ${c.border} ${c.text}` : "bg-white/[0.03] border-white/5 text-gray-500 hover:text-gray-300 hover:border-white/10"}`}
+      style={isActive ? { boxShadow:`0 0 20px ${c.glow}` } : {}}>
+      <span className={`w-1.5 h-1.5 rounded-full ${isActive ? c.dot : "bg-gray-600"} ${isActive ? "animate-pulse" : ""}`} />
+      {server.name}
+      {isActive && <span className="text-[9px] opacity-60 ml-1 hidden sm:inline">{server.label}</span>}
+    </button>
+  );
+  return (
+    <button onClick={onClick}
+      className={`w-full flex items-center gap-3 px-4 py-4 sm:py-3.5 rounded-xl text-left transition-all duration-200 border min-h-[44px] touch-manipulation active:scale-[0.98]
+        ${isActive ? `bg-gradient-to-br ${c.bg} ${c.border}` : "bg-white/[0.02] border-white/5 hover:bg-white/5 hover:border-white/10"}`}
+      style={isActive ? { boxShadow:`0 0 24px ${c.glow}` } : {}}>
+      <div className={`shrink-0 p-2 rounded-lg ${isActive ? `bg-gradient-to-br ${c.bg}` : "bg-white/5"}`}>
+        <div className={isActive ? c.text : "text-gray-600"}>{server.icon}</div>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className={`text-sm font-bold truncate ${isActive ? "text-white" : "text-gray-400"}`}>{server.name}</div>
+        <div className={`text-[10px] truncate ${isActive ? c.text : "text-gray-600"}`}>{server.label}</div>
+      </div>
+      {isActive && <span className={`shrink-0 w-2 h-2 rounded-full ${c.dot} animate-pulse`} />}
+    </button>
+  );
+};
+
+/* ===== Server color classes for grid ===== */
+const SRV_COLOR = {
+  mx:          "text-green-400  bg-green-500/10  border-green-500/30  hover:border-green-500/60",
+  imdb_reader: "text-yellow-400 bg-yellow-500/10 border-yellow-500/20 hover:border-yellow-500/50",
+  embed:       "text-indigo-400 bg-indigo-500/10 border-indigo-500/20 hover:border-indigo-500/50",
+  mirchi:      "text-rose-400   bg-rose-500/10   border-rose-500/20   hover:border-rose-500/50",
+  vidify:      "text-purple-400 bg-purple-500/10 border-purple-500/20 hover:border-purple-500/50",
+  videasy:     "text-blue-400   bg-blue-500/10   border-blue-500/20   hover:border-blue-500/50",
+  vidup:       "text-cyan-400   bg-cyan-500/10   border-cyan-500/20   hover:border-cyan-500/50",
+  tmdb:        "text-blue-400   bg-blue-500/10   border-blue-500/20   hover:border-blue-500/50",
+  "2embed":    "text-orange-400 bg-orange-500/10 border-orange-500/20 hover:border-orange-500/50",
+  modiplay:    "text-pink-400   bg-pink-500/10   border-pink-500/20   hover:border-pink-500/50",
+  hls:         "text-green-400  bg-green-500/10  border-green-500/20  hover:border-green-500/50",
+};
+
+/* ===================================================================
+   buildServers — derives available server list from meta
+=================================================================== */
+// MX Player content worker (search works from any IP). Used to detect whether a
+// TMDB/library title also exists on MX so it can be offered as the top server.
+const MX_WORKER = "https://silent-scene-b9bb.sanjusanjay0444.workers.dev";
+const mxNorm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const MX_STOP = new Set(["the", "a", "an", "of", "and", "in", "on", "to", "is", "hindi", "tamil", "telugu", "kannada", "malayalam", "season", "part"]);
+const mxToks = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter((w) => w.length > 1 && !MX_STOP.has(w));
+// Distinctive-token overlap ratio (0..1) between two titles.
+const mxScore = (a, b) => {
+  const A = new Set(mxToks(a)), B = new Set(mxToks(b));
+  if (!A.size || !B.size) return 0;
+  let shared = 0; A.forEach((t) => { if (B.has(t)) shared++; });
+  return shared / Math.min(A.size, B.size);
+};
+// Find the MX match for a title → { webUrl, id, type }. Uses id (some items omit
+// webUrl) and fuzzy token matching (MX often retitles, e.g. "Story" vs "Mystery").
+const lookupMx = async (title, isTV) => {
+  if (!title) return null;
+  try {
+    // Strip punctuation from the query — MX's search returns only trailers/junk for
+    // titles with ":" etc. ("Bhay: The Gaurav Tiwari Story" → nothing; cleaned → the show).
+    const query = title.replace(/[^a-zA-Z0-9\s]+/g, " ").replace(/\s+/g, " ").trim();
+    const r = await fetch(`${MX_WORKER}/?search=${encodeURIComponent(query)}`);
+    const d = await r.json();
+    const items = (d?.sections || []).flatMap((s) => s.items || [])
+      .filter((it) => it && it.title && it.id && (it.type === "movie" || it.type === "tvshow")); // no trailers/shorts
+    const want = mxNorm(title);
+    const wantToks = new Set(mxToks(title));
+    // 1) Exact normalized title, preferring the right kind.
+    let pick = items.find((it) => mxNorm(it.title) === want && (it.type === "tvshow") === !!isTV)
+            || items.find((it) => mxNorm(it.title) === want);
+    // 2) Fuzzy across ALL kinds (kind is only a tie-breaker, so a momentarily-wrong
+    //    isTV can't hide the match). Needs ≥2 shared distinctive tokens + ≥0.6 ratio,
+    //    so "Story"/"Mystery" match but unrelated titles don't.
+    if (!pick) {
+      const scored = items
+        .map((it) => ({
+          it,
+          s: mxScore(title, it.title),
+          shared: mxToks(it.title).filter((t) => wantToks.has(t)).length,
+          kind: (it.type === "tvshow") === !!isTV ? 1 : 0,
+        }))
+        .filter((x) => x.s >= 0.6 && (x.shared >= 2 || (wantToks.size <= 1 && x.s === 1)))
+        .sort((a, b) => b.kind - a.kind || b.s - a.s || b.shared - a.shared);
+      if (scored[0]) pick = scored[0].it;
+    }
+    return pick ? { webUrl: pick.webUrl || null, id: pick.id, type: pick.type } : null;
+  } catch (e) { return null; }
+};
+
+/* Server order is deliberate — the list is what the user sees AND what plays by
+   default (index 0 becomes the active server):
+     1. AnchorHD    — our own stream, when we host this title
+     2. Multi Audio — our uploaded mirror, the next best thing we control
+     3. Omega       — first of the third-party servers
+     4. everything else
+   So a title we host never opens on a third-party embed, and a title we don't
+   host opens on Omega. */
+const buildServers = (meta, eps = []) => {
+  const srv = [];
+  // Our own R2 HLS — highest priority when present (multi-audio, our CDN).
+  if (meta.hls_url || eps.some(e => e.direct_url || e.hls_url)) srv.push({ id:"ourhls", name:"AnchorHD", label:"Multi-Audio · Our CDN", icon:<Video size={14}/> });
+  // Our uploaded embed mirror — ahead of every third-party server.
+  if (meta.html_code || eps.some(e => e.html))
+    srv.push({ id:"embed",       name:"Multi Audio", label:"Backup Node",   icon:<Languages size={14}/> })
+  
+  if (meta.tmdb_id)
+    srv.push({ id:"mirchi", name:"Mirchi", label:"Hindi Audio", icon:<Languages size={14}/> });
+  // Always include Omega — at play-time we fall back to tmdb_id if imdb_id is absent
+  srv.push({ id:"imdb_reader", name:"Omega", label:"Direct Stream", icon:<Cpu size={14}/> });
+  if (meta.tmdb_id)
+    srv.push({ id:"modiplay", name:"Nova", label:"HD Embed", icon:<MonitorPlay size={14}/> });
+  // MX Player after ours — a real free HD stream, but still someone else's.
+  if (meta.mx_web_url || meta.mx_id) srv.push({ id:"mx", name:"MX Player", label:"Free HD", icon:<Zap size={14}/> });
+  if (meta.tmdb_id) {
+    srv.push({ id:"vidify",  name:"Vidify",  label:"Premium",     icon:<Zap size={14}/>     });
+    srv.push({ id:"videasy", name:"VidEasy", label:"Simple",       icon:<Globe size={14}/>   });
+  }
+  srv.push(
+    { id:"vidup",  name:"VidUp", label:"High Quality", icon:<Monitor size={14}/>    },
+    { id:"tmdb",   name:"Alpha", label:"Auto Select",  icon:<MonitorPlay size={14}/> },
+    { id:"2embed", name:"Prime", label:"Global CDN",   icon:<Globe size={14}/>       }
+  );
+  if (meta.video_url || eps.some(e => e.direct_url))
+    srv.push({ id:"hls", name:"Direct", label:"HLS Stream", icon:<Video size={14}/> });
+  return srv;
+};
+
+/* ===================================================================
+   attachLocalHls — when we arrive with router state (a TMDB pick, a search
+   result, the header's detail sheet), find whether we've ALSO uploaded this
+   title, and return the row so OUR servers — AnchorHD and Multi Audio — show
+   up alongside the third-party ones.
+   Match order: exact slug → exact tmdb_id → fuzzy title (+ year).
+=================================================================== */
+const localNorm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const LOCAL_COLS = "slug,hls_url,video_url,html_code,episodes,download_links";
+/* Any of these makes a row worth attaching: our own HLS, a direct file, the
+   uploaded embed (which is what "Multi Audio" plays), per-episode stream links —
+   or downloads. An embed-only row used to be discarded here, which is why Multi
+   Audio went missing for titles we had definitely uploaded; a DOWNLOAD-only row
+   was discarded for the same reason, which is why a title opened from global
+   search showed none of the downloads it plainly has. */
+const localUsable = (r) => !!(r && (r.hls_url || r.video_url || r.html_code ||
+  (Array.isArray(r.episodes) && r.episodes.length) ||
+  (Array.isArray(r.download_links) && r.download_links.length)));
+
+const attachLocalHls = async (m) => {
+  try {
+    /* 1) exact slug — what our own rows arrive under, and the only match that
+          works for an upload carrying no tmdb_id. */
+    if (m.slug) {
+      const { data } = await supabase.from("watch_html")
+        .select(LOCAL_COLS).eq("slug", m.slug).limit(1);
+      if (localUsable(data && data[0])) return data[0];
+    }
+    // 2) exact tmdb_id — reliable when the watch_html row is tagged with one.
+    if (m.tmdb_id) {
+      const { data } = await supabase.from("watch_html")
+        .select(LOCAL_COLS).eq("tmdb_id", String(m.tmdb_id)).limit(1);
+      if (localUsable(data && data[0])) return data[0];
+    }
+    /* 3) fuzzy title across every row that carries a stream of any kind.
+          Note there is no `year` column on watch_html — selecting one made this
+          query 400 and quietly return nothing, so this branch never actually
+          ran. The year agreement boost below reads whatever the row carries and
+          is simply skipped when it carries none. */
+    const { data: rows } = await supabase.from("watch_html")
+      .select(`${LOCAL_COLS},title`)
+      .or("hls_url.not.is.null,html_code.not.is.null,video_url.not.is.null,download_links.not.is.null")
+      .limit(500);
+    if (!rows || !rows.length) return null;
+    const STOP = new Set(["the","and","of","a","an","in","on","to","is","hindi","tamil","telugu","kannada","malayalam","english","season","part","movie","full","hd","www"]);
+    const toks = (t) => localNorm(t).split(" ").filter((w) => w.length > 2 && !STOP.has(w));
+    const wantToks = new Set(toks(m.title));
+    if (!wantToks.size) return null;
+    const wantYear = m.year ? String(m.year) : null;
+    let best = null, bestScore = 0, bestShared = 0;
+    for (const r of rows) {
+      const rToks = new Set(toks(r.title));
+      if (!rToks.size) continue;
+      let shared = 0; wantToks.forEach((t) => { if (rToks.has(t)) shared++; });
+      if (!shared) continue;
+      let score = shared / Math.min(wantToks.size, rToks.size);
+      if (wantYear && r.year && String(r.year) === wantYear) score += 0.15;   // year agreement boost
+      if (score > bestScore) { bestScore = score; best = r; bestShared = shared; }
+    }
+    // Solid overlap AND ≥2 distinctive shared tokens (or a genuine single-word title)
+    return (bestScore >= 0.6 && (bestShared >= 2 || wantToks.size === 1)) ? best : null;
+  } catch { return null; }
+};
+
+/* ===================================================================
+   WatchHtmlPage
+=================================================================== */
+const WatchHtmlPage = () => {
+  const { slug: routeSlug } = useParams();
+  const navigate   = useNavigate();
+  const location   = useLocation();
+  const { backendUrl } = useContext(AppContext);
+
+  const [loading,           setLoading          ] = useState(true);
+  const [movieMeta,         setMovieMeta        ] = useState(null);
+  const [tmdbMeta,          setTmdbMeta         ] = useState(null);
+  const [episodes,          setEpisodes         ] = useState([]);
+  const [availableServers,  setAvailableServers ] = useState([]);
+  const [activeServer,      setActiveServer     ] = useState(null);
+  const [activeSeason,      setActiveSeason     ] = useState("S1");
+  const [openDropdown,      setOpenDropdown     ] = useState(null);
+  const [imgLoaded,         setImgLoaded        ] = useState(false);
+
+  const [showOverlay,       setShowOverlay      ] = useState(false);
+  const [finalSource,       setFinalSource      ] = useState(null);
+  const [mxResolving,       setMxResolving      ] = useState(false);
+  const [sourceType,        setSourceType       ] = useState(null);
+  const [videoTitle,        setVideoTitle       ] = useState(routeSlug);
+  const [currentOverlayEp,  setCurrentOverlayEp ] = useState(null);
+  const [resumeStart,       setResumeStart      ] = useState(0);   // seconds to resume our-HLS playback
+  const [continueList,      setContinueList     ] = useState([]);  // continue-watching row
+  const lastSaveRef = useRef(0);
+  const resumedRef = useRef(false);
+  const autoPlayedRef = useRef(false);   // state.autoPlay → open the player once
+
+  const [showSettingsPanel, setShowSettingsPanel] = useState(false);
+  const [autoNextEpisode,   setAutoNextEpisode  ] = useState(true);
+  const [spoilerProtection, setSpoilerProtection] = useState(true);
+  const [activeTab,         setActiveTab        ] = useState("servers");
+
+  const groupedEpisodes = useMemo(() => groupEpisodesBySeason(episodes), [episodes]);
+
+  // Index of the currently-playing episode within the flat episodes list (for the
+  // in-player episode switcher + auto-next).
+  const currentEpIndex = useMemo(() => {
+    if (!currentOverlayEp || !episodes.length) return 0;
+    const i = episodes.findIndex((e) =>
+      (e.globalIndex != null && e.globalIndex === currentOverlayEp.globalIndex) ||
+      ((e.season || 1) === (currentOverlayEp.season || 1) &&
+        (e.episodeNumberInSeason || e.episode) === (currentOverlayEp.episodeNumberInSeason || currentOverlayEp.episode)));
+    return i >= 0 ? i : 0;
+  }, [episodes, currentOverlayEp]);
+
+  // Profile language (persisted by WatchListPage) → the player auto-picks that audio.
+  const preferredAudioLang = useMemo(() => {
+    try { const l = JSON.parse(localStorage.getItem("profile_langs") || "[]"); return Array.isArray(l) && l.length ? l[0] : ""; }
+    catch { return ""; }
+  }, []);
+
+  /* Lock body scroll behind the overlay player on mobile so the iframe
+     is the only scrollable/interactive surface and nothing shifts under touch */
+  useEffect(() => {
+    if (showOverlay) {
+      const prevOverflow = document.body.style.overflow;
+      const prevTouch = document.body.style.touchAction;
+      document.body.style.overflow = "hidden";
+      document.body.style.touchAction = "none";
+      return () => {
+        document.body.style.overflow = prevOverflow;
+        document.body.style.touchAction = prevTouch;
+      };
+    }
+  }, [showOverlay]);
+
+  /* ── Fresh download links, signed on every visit ──────────────────────────
+     A stored entry can carry a `path` instead of a URL: the file sits on R2 and
+     Cloudflare serves it against a token that only lasts a day. Signing here,
+     on load, means the page always hands out a live link and the bytes never
+     touch our own bandwidth. Entries that already carry a plain `url` are left
+     exactly as they are. */
+  const [signedLinks, setSignedLinks] = useState({});   // path → signed url
+
+  useEffect(() => {
+    const paths = (movieMeta?.download_links || [])
+      .flatMap(b => b?.links || [])
+      .map(l => l?.path)
+      .filter(Boolean);
+    if (!paths.length || !backendUrl) return;
+
+    let alive = true;
+    (async () => {
+      const pairs = await Promise.all([...new Set(paths)].map(async (path) => {
+        try {
+          const { data } = await axios.get(`${backendUrl}/api/download-link`, {
+            params: { path, hours: 24 }, timeout: 10000,
+          });
+          return data?.success ? [path, data.url] : null;
+        } catch { return null; }      // the button falls back to whatever it had
+      }));
+      if (alive) setSignedLinks(Object.fromEntries(pairs.filter(Boolean)));
+    })();
+    return () => { alive = false; };
+  }, [movieMeta?.download_links, backendUrl]);
+
+  /* ── fetch full TMDB detail (cast + episodes + runtime etc.) ── */
+const fetchFullTmdb = useCallback(async (tmdbId, imdbId, contentType) => {
+    if (!backendUrl) return null;
+    // Build params — always send whatever identifiers we have
+    // Backend now handles tmdbId+contentType directly (no search round-trip)
+    const params = {};
+    if (imdbId)      params.imdbId      = imdbId;
+    if (tmdbId)      params.tmdbId      = String(tmdbId);
+    if (contentType) params.contentType = contentType;
+    if (!imdbId && !tmdbId) return null;
+    try {
+      const res = await axios.get(`${backendUrl}/api/tmdb-details`, { params });
+      if (!res.data?.success) return null;
+      const d    = res.data.data;
+      const cast = d?.cast ?? d?.credits?.cast ?? d?.aggregate_credits?.cast ?? [];
+
+      // Normalize episodes: backend returns { season, episode, title, overview, still_path }
+      // Frontend needs: { season, episodeNumberInSeason, title, description, thumbnail }
+      const episodes = (d?.episodes || []).map(ep => ({
+        season:                ep.season        || ep.season_number || 1,
+        season_number:         ep.season        || ep.season_number || 1,
+        episodeNumberInSeason: ep.episode       || ep.episode_number || 1,
+        episode:               ep.episode       || ep.episode_number || 1,
+        title:                 ep.title         || ep.name          || `Episode ${ep.episode || 1}`,
+        name:                  ep.title         || ep.name          || "",
+        description:           ep.overview      || ep.description   || "",
+        thumbnail:             ep.still_path
+          ? (ep.still_path.startsWith("http")
+              ? ep.still_path
+              : `https://image.tmdb.org/t/p/w300${ep.still_path}`)
+          : null,
+        air_date: ep.air_date || null,
+      }));
+
+      return { ...d, cast, episodes };
+    } catch { return null; }
+  }, [backendUrl]);
+
+  /* ── fetch episodes for a TV series via /api/tmdb-episodes ── */
+const fetchTmdbEpisodes = useCallback(async (tmdbId, imdbId) => {
+  if (!backendUrl) return [];
+  const params = {};
+  if (tmdbId) params.tmdbId = String(tmdbId);
+  else if (imdbId) params.imdbId = imdbId;
+  else return [];
+  try {
+    const res = await axios.get(`${backendUrl}/api/tmdb-episodes`, { params });
+    if (!res.data?.success) return [];
+    return res.data.episodes || [];
+  } catch { return []; }
+}, [backendUrl]);
+  
+
+  /* ── MX Player: resolve the real stream on the backend, then play it in the
+     StreamX iframe. Series go to the dedicated /mx-watch page (all seasons). ── */
+  // All MX playback (movies + series) goes through /mx-watch → the native
+  // VideoPlayer (hls.js), for one consistent player everywhere.
+  const playMx = useCallback(() => {
+    if (!movieMeta?.mx_web_url && !movieMeta?.mx_id) return;
+    navigate("/mx-watch", { state: { webUrl: movieMeta.mx_web_url, mxId: movieMeta.mx_id, mxType: movieMeta.mx_type, title: movieMeta.title } });
+  }, [movieMeta, navigate]);
+
+  /* ── Our own R2 HLS → plays INLINE in the same overlay as every other server
+     (via the site's /player.html, which handles HLS + audio tracks), so it's
+     one consistent, mobile-fit player — no separate page. ── */
+  // Route THIRD-PARTY HLS through our backend CORS proxy (hls.js needs CORS on
+  // the manifest + every segment). Our own R2/worker streams already send CORS
+  // (and a token), and direct .mp4 plays natively without CORS — so skip those.
+  const maybeProxy = useCallback((u) => {
+    if (!u || !/^https?:/i.test(u)) return u;
+    if (!/\.m3u8($|\?)/i.test(u)) return u;                         // only HLS needs the proxy
+    try { if (/1anchormovies|r2\.dev|cloudflarestorage|workers\.dev/i.test(new URL(u).host)) return u; } catch {}
+    return `${backendUrl}/api/hls-proxy?url=${encodeURIComponent(u)}`;
+  }, [backendUrl]);
+
+  // Play a movie-level stream in our rich VideoPlayer. Accepts either our HLS
+  // (m3u8) field or a Direct URL — both go through the same player (m3u8 via
+  // hls.js, direct .mp4/.mkv natively). A full http(s)/blob link plays as-is;
+  // an R2 path (movies/<slug>/master.m3u8) is signed via the backend.
+  const playOurHls = useCallback(async (preferLink = null) => {
+    const link = preferLink || movieMeta?.hls_url || movieMeta?.video_url;
+    if (!link) return;
+    setMxResolving(true);
+    try {
+      let url = link;
+      if (!/^(https?:|blob:)/i.test(link)) {
+        const r = await fetch(`${backendUrl}/api/movie-stream?path=${encodeURIComponent(link)}`);
+        const j = await r.json();
+        url = j?.success && j.url ? j.url : null;
+      }
+      if (url) {
+        setResumeStart(getResumeTime(movieMeta.slug || routeSlug));   // resume movie
+        setFinalSource(maybeProxy(url));   // signed m3u8 / direct URL / proxied 3rd-party HLS
+        setSourceType("hls");
+        setVideoTitle(movieMeta.title || routeSlug);
+        setShowOverlay(true);
+      }
+    } catch { /* ignore — user can pick another server */ }
+    setMxResolving(false);
+  }, [movieMeta, backendUrl, routeSlug, maybeProxy]);
+
+  /* ── Resolve an episode's stream link to a playable URL. A full http(s) link
+     plays as-is; an R2 path (movies/<slug>/master.m3u8) is signed via the backend. ── */
+  const resolveStreamLink = useCallback(async (link) => {
+    if (!link) return null;
+    if (/^(https?:|blob:)/i.test(link)) return link;
+    try {
+      const r = await fetch(`${backendUrl}/api/movie-stream?path=${encodeURIComponent(link)}`);
+      const j = await r.json();
+      return j?.success && j.url ? j.url : null;
+    } catch { return null; }
+  }, [backendUrl]);
+
+  /* ── Play one episode's stream link in our rich VideoPlayer (episode-wise). ── */
+  const playEpisodeStream = useCallback(async (ep) => {
+    const link = ep?.direct_url || ep?.hls_url;
+    if (!link) return false;
+    setMxResolving(true);
+    const url = await resolveStreamLink(link);
+    setMxResolving(false);
+    if (!url) return false;
+    // Resume only if the saved position is for THIS episode; a different episode starts fresh.
+    const saved = readOne(movieMeta?.slug || routeSlug);
+    const epNo = ep.episodeNumberInSeason || ep.episode || null;
+    const sameEp = saved && String(saved.season) === String(ep.season || 1) && String(saved.episode) === String(epNo);
+    setResumeStart(sameEp ? (saved.time || 0) : 0);
+    setCurrentOverlayEp(ep);
+    setFinalSource(maybeProxy(url));    // proxy 3rd-party HLS; our own streams pass through
+    setSourceType("hls");               // → the rich VideoPlayer (with episode switcher)
+    setVideoTitle(`${movieMeta?.title || routeSlug} — S${ep.season || 1}E${epNo || 1}`);
+    setShowOverlay(true);
+    return true;
+  }, [resolveStreamLink, movieMeta, routeSlug, maybeProxy]);
+
+  /* ── Re-sign an expired stream URL and carry on from the same second.
+     Our R2 links are signed for 24h; if one is rejected mid-playback the
+     player asks for a fresh one instead of dying. ── */
+  const refreshSource = useCallback(async (atSeconds) => {
+    const link = currentOverlayEp?.direct_url || currentOverlayEp?.hls_url
+      || movieMeta?.hls_url || movieMeta?.video_url;
+    if (!link) return;
+    const url = await resolveStreamLink(link);
+    if (!url) return;
+    setResumeStart(atSeconds || 0);
+    setFinalSource(maybeProxy(url));
+  }, [currentOverlayEp, movieMeta, resolveStreamLink, maybeProxy]);
+
+  /* ── Continue Watching: throttled progress save while our HLS plays ── */
+  const handleProgress = useCallback((time, duration) => {
+    if (!movieMeta || !(time > 0)) return;
+    const nearEnd = duration && time >= duration - 3;
+    const now = Date.now();
+    if (now - lastSaveRef.current < 4000 && !nearEnd) return;   // throttle to ~4s
+    lastSaveRef.current = now;
+    const ep = currentOverlayEp;
+    // Next episode (for the "Next Episode" card once this one finishes).
+    let next = null;
+    if (ep && episodes.length) {
+      const ci = episodes.findIndex(e => String(e.season || 1) === String(ep.season || 1) &&
+        String(e.episodeNumberInSeason || e.episode) === String(ep.episodeNumberInSeason || ep.episode));
+      const ne = ci >= 0 && ci < episodes.length - 1 ? episodes[ci + 1] : null;
+      if (ne) next = { season: ne.season || 1, episode: ne.episodeNumberInSeason || ne.episode, epTitle: ne.title || ne.name || null };
+    }
+    saveProgress({
+      slug: movieMeta.slug || routeSlug,
+      title: movieMeta.title,
+      logo: movieMeta.title_logo,
+      poster: movieMeta.poster,
+      backdrop: movieMeta.background || movieMeta.cover_poster,
+      content_type: movieMeta.content_type,
+      tmdb_id: movieMeta.tmdb_id,
+      imdb_id: movieMeta.imdb_id,
+      source: "tmdb",
+      season: ep?.season || (movieMeta.content_type === "tv" ? 1 : null),
+      episode: ep?.episodeNumberInSeason || ep?.episode || null,
+      epTitle: ep?.title || ep?.name || null,
+      next,
+      time, duration,
+    });
+  }, [movieMeta, routeSlug, currentOverlayEp, episodes]);
+
+  const loadContinue = useCallback(() => setContinueList(readContinueList()), []);
+  useEffect(() => { loadContinue(); }, [loadContinue]);
+
+  // Resume a continue-watching card: rebuild a movie payload and play it.
+  const resumeItem = useCallback((r) => {
+    if (!r) return;
+    if (r.slug === (movieMeta?.slug || routeSlug)) {
+      // same title already open → just start playback (episode or movie)
+      if (r.content_type === "tv" && episodes.length) {
+        const ep = episodes.find(e => String(e.season || 1) === String(r.season) &&
+          String(e.episodeNumberInSeason || e.episode) === String(r.episode)) || episodes[0];
+        playEpisodeStream(ep);
+      } else { playOurHls(); }
+    } else {
+      navigate(`/watch/${r.slug}`, { state: { movie: { ...r, source: r.source || "tmdb" }, resume: r } });
+    }
+  }, [movieMeta, routeSlug, episodes, playEpisodeStream, playOurHls, navigate]);
+
+  // Auto-resume when we arrived here from a Continue-Watching card (state.resume).
+  useEffect(() => {
+    const r = location.state?.resume;
+    if (!r || resumedRef.current || !movieMeta) return;
+    if (movieMeta.content_type === "tv" && episodes.length === 0) return;  // wait for episodes
+    resumedRef.current = true;
+    resumeItem(r);
+  }, [location.state, movieMeta, episodes, resumeItem]);
+
+  /* ── handlePlayAction ── */
+  const handlePlayAction = useCallback((manualEp = null, forceServer = null) => {
+    if (!movieMeta) return;
+
+    let serverId   = forceServer || activeServer?.id || availableServers[0]?.id;
+    const ep       = manualEp || currentOverlayEp;
+    // AnchorHD / Direct → play OUR stream when available (episode-wise for series).
+    // Only if there's no stream do we fall back to the embed mirror for this item,
+    // so selecting AnchorHD never silently opens Multi Audio when a stream exists.
+    if (serverId === "ourhls" || serverId === "hls") {
+      if (ep) {
+        // Series: play the episode's own stream link in our VideoPlayer.
+        if (ep.direct_url || ep.hls_url) { playEpisodeStream(ep); return; }
+        if (ep.html || ep.html_code) serverId = "embed";       // else fall to the embed mirror
+      } else {
+        // Movies: play OUR stream in the VideoPlayer. AnchorHD prefers the HLS
+        // (m3u8) field; Direct prefers the direct URL — both handled by the same
+        // player (m3u8 via hls.js, direct .mp4/.mkv natively).
+        const movieLink = serverId === "hls"
+          ? (movieMeta.video_url || movieMeta.hls_url)
+          : (movieMeta.hls_url || movieMeta.video_url);
+        if (movieLink) { playOurHls(movieLink); return; }
+        if (movieMeta.html_code) serverId = "embed";
+      }
+    }
+    if (serverId === "mx") { playMx(ep); return; } // MX has its own async resolve path
+
+    const imdb = (movieMeta.imdb_id || "").trim();
+    const tmdb = String(movieMeta.tmdb_id || movieMeta.id || "");
+    const id   = tmdb || imdb;
+    const isTV = movieMeta.content_type === "tv" || episodes.length > 0;
+
+    const s = ep?.season                  || 1;
+    const e = ep?.episodeNumberInSeason   || 1;
+
+    let src  = null;
+    let type = "url";
+    let label = movieMeta.title || routeSlug;
+    if (ep) {
+      label = `${movieMeta.title || routeSlug} — S${s}E${e}`;
+      setCurrentOverlayEp(ep);
+    }
+
+    const TV   = isTV || !!ep;
+    const p_vidify  = "autoplay=false&poster=true&chromecast=true&servericon=true&setting=true&pip=true&logourl=https%3A%2F%2Fi.postimg.cc%2Fd05hg4kT%2Flogo-39.png&font=Roboto&fontcolor=6f63ff&fontsize=20&opacity=0.5&primarycolor=3b82f6&secondarycolor=1f2937&iconcolor=ffffff";
+    const p_videasy = "nextEpisode=true&autoplayNextEpisode=true&episodeSelector=true&overlay=true&color=3B82F6";
+
+    switch (serverId) {
+      case "imdb_reader": { const omegaId = imdb || tmdb; if (omegaId) src = `https://slast430did.com/play/${omegaId}`; break; }
+      case "mirchi": if (tmdb) src = TV
+          ? `https://nxsha.space/embed/tv/${tmdb}/${s}/${e}`
+          : `https://nxsha.space/embed/movie/${tmdb}`;
+        break;
+      case "vidify":  if (tmdb) src = TV ? `https://player.vidify.top/embed/tv/${tmdb}/${s}/${e}?${p_vidify}`   : `https://player.vidify.top/embed/movie/${tmdb}?${p_vidify}`;   break;
+      case "videasy": if (tmdb) src = TV ? `https://player.videasy.net/tv/${tmdb}/${s}/${e}?${p_videasy}` : `https://player.videasy.net/movie/${tmdb}?${p_videasy}`; break;
+      case "vidup":   if (id)   src = TV ? `https://vidup.to/tv/${id}/${s}/${e}?autoPlay=true`            : `https://vidup.to/movie/${id}?autoPlay=true`;            break;
+      case "tmdb":    if (tmdb) src = TV ? `https://vidlink.pro/tv/${tmdb}/${s}/${e}`                     : `https://vidlink.pro/movie/${tmdb}`;                     break;
+      case "2embed":  if (id)   src = TV ? `https://www.2embed.cc/embedtv/${id}&s=${s}&e=${e}`            : `https://www.2embed.cc/embed/${id}`;                     break;
+      case "modiplay":if (tmdb) src = TV ? `https://rozgarlelo.modiplay.xyz/embed/tmdb/tv?id=${tmdb}&s=${s}&e=${e}` : `https://rozgarlelo.modiplay.xyz/embed/tmdb/movie?id=${tmdb}`; break;
+      case "hls":
+        // Direct server → our VideoPlayer, so ANY HLS (.m3u8) or direct URL plays.
+        src  = ep ? (ep.direct_url || ep.hls_url) : (movieMeta.video_url || movieMeta.hls_url);
+        type = "hls"; break;
+      case "embed":
+        src  = ep ? (ep.html || ep.html_code) : movieMeta.html_code;
+        type = src ? "html" : null; break;
+      default: break;
+    }
+
+    // Ultimate fallback — videasy works for both movies and TV with just tmdb_id
+    if (!src && tmdb) {
+      src = TV
+        ? `https://player.videasy.net/tv/${tmdb}/${s}/${e}?${p_videasy}`
+        : `https://player.videasy.net/movie/${tmdb}?${p_videasy}`;
+    }
+
+    if (src) {
+      setFinalSource(type === "hls" ? maybeProxy(src) : src);   // proxy 3rd-party HLS for CORS
+      setSourceType(type);
+      setVideoTitle(label);
+      setShowOverlay(true);
+    }
+  }, [movieMeta, activeServer, availableServers, currentOverlayEp, episodes, routeSlug, playMx, playOurHls, playEpisodeStream, maybeProxy]);
+
+  /* Closing the player: when we were opened straight from the mobile detail
+     sheet, go back to it instead of revealing the watch page underneath. */
+  const closeOverlay = useCallback(() => {
+    setShowOverlay(false);
+    setCurrentOverlayEp(null);
+    setShowSettingsPanel(false);
+    loadContinue();
+    if (location.state?.autoPlay) navigate(-1);
+  }, [location.state, navigate, loadContinue]);
+
+  /* ── autoPlay: the mobile detail sheet sends users straight into the player,
+       so the watch page itself is never shown. state.autoPlayEpisode picks the
+       episode; without it a series starts on its first episode. ── */
+  useEffect(() => {
+    if (!location.state?.autoPlay || autoPlayedRef.current) return;
+    if (loading || !movieMeta || !availableServers.length) return;
+    const want = location.state?.autoPlayEpisode;
+    const isTV = episodes.length > 0 || !!want;
+
+    let ep = null;
+    if (isTV) {
+      ep = want
+        ? episodes.find(e =>
+            String(e.season || 1) === String(want.season) &&
+            String(e.episodeNumberInSeason || e.episode) === String(want.episode))
+        : null;
+      // The sheet lists every season/episode TMDB knows about, so the pick may be
+      // one we haven't uploaded — play it on a server using its numbers.
+      if (!ep && want) {
+        ep = { season: Number(want.season) || 1, episodeNumberInSeason: Number(want.episode) || 1,
+               episode: Number(want.episode) || 1, title: `Episode ${want.episode}` };
+      }
+      ep = ep || episodes[0];
+    }
+
+    autoPlayedRef.current = true;
+
+    /* AnchorHD (our own R2 stream) plays immediately — that's the whole point of
+       coming straight from the detail overlay. Anything else needs a choice, so
+       we stay on this page and open its server list for exactly this item. */
+    const anchorHd = ep
+      ? (ep.direct_url || ep.hls_url)
+      : (movieMeta.hls_url || movieMeta.video_url);
+
+    if (anchorHd) {
+      const srv = availableServers.find(s => s.id === "ourhls") ||
+                  availableServers.find(s => s.id === "hls");
+      if (srv) setActiveServer(srv);
+      handlePlayAction(ep, srv?.id);
+      return;
+    }
+
+    setCurrentOverlayEp(ep);          // servers picked below apply to this episode
+    setActiveTab("servers");
+    if (ep) {
+      // Open this episode's own server menu, like tapping it on this page does.
+      const key = `S${ep.season || 1}`;
+      setActiveSeason(key);
+      const idx = (groupedEpisodes[key]?.episodes || []).findIndex(e =>
+        String(e.episodeNumberInSeason || e.episode) === String(ep.episodeNumberInSeason || ep.episode));
+      setOpenDropdown(idx >= 0 ? idx : null);
+    }
+    setTimeout(() => {
+      document.getElementById(ep ? "episodes-section" : "servers-section")
+        ?.scrollIntoView({ behavior: "smooth", block: ep ? "start" : "center" });
+    }, 120);
+  }, [location.state, loading, movieMeta, episodes, availableServers, handlePlayAction, groupedEpisodes]);
+
+  const handleServerSwitch = (server) => {
+    setActiveServer(server);
+    handlePlayAction(currentOverlayEp, server.id);
+  };
+
+  /* ── Main data fetch ── */
+  useEffect(() => {
+    let alive = true;
+
+    const run = async () => {
+      setLoading(true);
+      try {
+        let meta  = null;
+        let tData = null;
+        let eps   = [];
+
+        /* ══ BRANCH A: TMDB content passed via router state ══
+           Handles both buildTmdbMovie().tmdbPayload objects
+           AND raw TMDB search-result objects from SearchResults page.
+           content_type is now reliable — set by detectContentType() in WatchListPage.  */
+        const stateMovie = location.state?.movie;
+        if (stateMovie) {
+          const tmdbId      = stateMovie.tmdb_id || stateMovie.id   || null;
+          const imdbId      = stateMovie.imdb_id                     || null;
+
+          if (!tmdbId && !imdbId) {
+            console.warn("[WatchHtmlPage] stateMovie has no tmdb_id/imdb_id:", stateMovie);
+          }
+
+          // Use the robust helper — handles all payload shapes
+          const contentType = detectStateContentType(stateMovie);
+
+          meta = {
+            source:       "tmdb",
+            slug:         stateMovie.slug || generateSlug(stateMovie.title || stateMovie.name || "") || routeSlug,
+            title:        stateMovie.title || stateMovie.name || routeSlug,
+            tmdb_id:      tmdbId ? String(tmdbId) : null,
+            imdb_id:      imdbId,
+            content_type: contentType,
+            poster:       safeURI(stateMovie.poster
+              || (stateMovie.poster_path ? `https://image.tmdb.org/t/p/w500${stateMovie.poster_path}` : "/default-poster.jpg")),
+            background:   safeURI(stateMovie.cover_poster
+              || (stateMovie.backdrop_path ? `https://image.tmdb.org/t/p/original${stateMovie.backdrop_path}` : null)
+              || stateMovie.poster || "/default-cover.jpg"),
+            imdbRating:   stateMovie.imdb_rating != null
+              ? String(stateMovie.imdb_rating)
+              : (stateMovie.vote_average != null ? Number(stateMovie.vote_average).toFixed(1) : "0.0"),
+            year:         stateMovie.year
+              || stateMovie.release_date?.split("-")[0]
+              || stateMovie.first_air_date?.split("-")[0]
+              || null,
+            description:  stateMovie.description || stateMovie.overview || "No description available.",
+            genres:       (stateMovie.genres || []).map(g => typeof g === "object" ? g.name : g),
+            certification: stateMovie.certification || null,
+            runtime:      stateMovie.runtime || null,
+            title_logo:   stateMovie.title_logo || stateMovie.title_logo_english || null,
+            download_links: stateMovie.download_links || [],
+            video_url:    stateMovie.video_url || null,
+            hls_url:      stateMovie.hls_url || null,
+            html_code:    stateMovie.html_code || null,
+            mx_web_url:   stateMovie.mxWebUrl || stateMovie.mx_web_url || null,
+          };
+
+          eps = Array.isArray(stateMovie.episodes) ? stateMovie.episodes : [];
+
+          // Enrich with full TMDB detail (cast, episodes, runtime, genres, imdb_id …)
+          // Pass the detected contentType so the backend fetches the right endpoint
+          if (tmdbId || imdbId) {
+            const full = await fetchFullTmdb(tmdbId, imdbId, contentType);
+            if (full) {
+              tData = full;
+              // The full TMDB response may reveal TV status we didn't know before
+              const enrichedContentType =
+                full.content_type === "tv" ? "tv"
+                : full.content_type === "movie" ? "movie"
+                : contentType;
+
+              // A TMDB-search pick already carries correct, properly-typed data — trust
+              // it. Only rewrite the DISPLAY fields for OUR DB entries (messy upload
+              // titles), whose tmdb_id points at the right entity. This stops a
+              // same-named film's details (e.g. a 1982 movie) from overwriting a series.
+              const isTmdbPick = stateMovie.source === "tmdb" || stateMovie.isTmdbOnly === true;
+              const fullGenres = (full.genres || []).map(g => typeof g === "object" ? g.name : g);
+              meta = {
+                ...meta,
+                imdb_id:    meta.imdb_id    || full.imdb_id    || null,
+                tmdb_id:    meta.tmdb_id    || String(full.tmdb_id || full.id || ""),
+                runtime:    full.runtime    || meta.runtime,
+                certification: full.certification || meta.certification,
+                content_type: enrichedContentType,       // always trust enriched type
+                title_logo: meta.title_logo || full.title_logo_english || full.title_logo || null,
+                title:      isTmdbPick ? meta.title      : (full.title || full.name || meta.title),
+                poster:     isTmdbPick ? meta.poster     : safeURI(full.poster_url || full.poster || meta.poster),
+                background: isTmdbPick ? meta.background  : safeURI(full.cover_poster_url || full.backdrop || meta.background),
+                year:       isTmdbPick ? meta.year       : (full.year || meta.year),
+                description: isTmdbPick ? meta.description : (full.overview || full.description || meta.description),
+                imdbRating: isTmdbPick ? meta.imdbRating  : (full.imdb_rating != null ? String(full.imdb_rating) : meta.imdbRating),
+                genres:     isTmdbPick ? meta.genres      : (fullGenres.length > 0 ? fullGenres : meta.genres),
+              };
+              if (Array.isArray(full.episodes) && full.episodes.length > 0) eps = full.episodes;
+            }
+          }
+
+          // ── If we've also uploaded this title (a watch_html row with an hls_url
+          //    OR episode stream links), attach it so AnchorHD appears from a TMDB
+          //    search — for movies AND series. ──
+          const localHls = await attachLocalHls(meta);
+          if (localHls) {
+            meta = {
+              ...meta,
+              hls_url:   meta.hls_url   || localHls.hls_url   || null,
+              video_url: meta.video_url || localHls.video_url || null,
+              html_code: meta.html_code || localHls.html_code || null,
+              /* A title picked from global search carries no downloads of its
+                 own — TMDB has none. The row we just matched does, and it is the
+                 same film, so the Downloads section appears from a global result
+                 exactly as it does from a local one. */
+              download_links: (meta.download_links && meta.download_links.length)
+                ? meta.download_links
+                : (Array.isArray(localHls.download_links) ? localHls.download_links : []),
+            };
+            // Series: use OUR episodes (with per-episode stream links) as the merge
+            // source below, so AnchorHD shows and each episode plays from our stream.
+            if (Array.isArray(localHls.episodes) && localHls.episodes.length) eps = localHls.episodes;
+          }
+        }
+
+        /* ══ BRANCH B: local Supabase lookup (no router state) ══ */
+        if (!meta) {
+          const [watchRes, movieRes] = await Promise.all([
+            supabase.from("watch_html").select("*").eq("slug", routeSlug).maybeSingle(),
+            supabase.from("movies").select("*").eq("slug", routeSlug).maybeSingle(),
+          ]);
+          let watchData = watchRes.data;
+          let movieData = movieRes.data;
+
+          if (!movieData?.description && watchData?.title) {
+            const { data: tm } = await supabase.from("movies").select("*").eq("title", watchData.title).maybeSingle();
+            if (tm) movieData = tm;
+          }
+
+          if (watchData) {
+            const localEps = Array.isArray(watchData.episodes) ? watchData.episodes : [];
+            // If the upload has episodes it's a SERIES — force TMDB to resolve as
+            // /tv/{id}. Movie and TV ids are separate namespaces, so querying a
+            // series' id as a movie returns a completely unrelated film (wrong
+            // poster / year / runtime / episode names). Episodes present overrides
+            // any stale content_type stored on the row.
+            const ctype = localEps.length ? "tv" : (watchData.content_type || null);
+            // Enrich by tmdb_id OR imdb_id so direct visits also get TMDB metadata.
+            tData = (watchData.tmdb_id || watchData.imdb_id)
+              ? await fetchFullTmdb(watchData.tmdb_id, watchData.imdb_id, ctype)
+              : null;
+            eps   = localEps;
+            if (eps.length === 0 && Array.isArray(tData?.episodes)) eps = tData.episodes;
+
+            meta = {
+              source:       "local",
+              ...watchData,
+              // Prefer TMDB's clean title/poster over the messy upload title.
+              title:        tData?.title || tData?.name || watchData.title || watchData.slug,
+              tmdb_id:      watchData.tmdb_id || tData?.tmdb_id || null,
+              imdb_id:      watchData.imdb_id || null,
+              content_type: (eps.length > 0 || ctype === "tv") ? "tv" : (watchData.content_type || tData?.content_type || "movie"),
+              poster:       safeURI(tData?.poster_url || watchData.poster || "/default-poster.jpg"),
+              background:   safeURI(tData?.cover_poster_url || watchData.cover_poster || watchData.poster),
+              imdbRating:   watchData.imdb_rating || tData?.imdb_rating?.toFixed?.(1) || "0.0",
+              year:         watchData.year || tData?.year || null,
+              description:  movieData?.description || tData?.overview || watchData?.description || "No description available.",
+              genres:       watchData.genres
+                || (tData?.genres || []).map(g => typeof g === "object" ? g.name : g) || [],
+              download_links: Array.isArray(watchData.download_links) ? watchData.download_links : [],
+            };
+          }
+        }
+
+if (!alive) return;
+
+        if (meta) {
+          const isTV = meta.content_type === "tv" || eps.length > 0;
+
+          // Safety net for every path: if it's a series but the TMDB metadata was
+          // resolved as a MOVIE (wrong namespace → unrelated film's poster/year),
+          // re-fetch as /tv and replace the poster/backdrop/year/rating/genres.
+          if (isTV && (meta.tmdb_id || meta.imdb_id) && meta.content_type !== "tv") {
+            const tv = await fetchFullTmdb(meta.tmdb_id, meta.imdb_id, "tv");
+            if (tv) {
+              tData = tv;
+              meta = {
+                ...meta,
+                content_type: "tv",
+                title:      tv.title || tv.name || meta.title,
+                poster:     safeURI(tv.poster_url || meta.poster),
+                background: safeURI(tv.cover_poster_url || meta.background),
+                year:       tv.year || meta.year,
+                imdbRating: tv.imdb_rating?.toFixed?.(1) || meta.imdbRating,
+                genres:     (tv.genres || []).map(g => typeof g === "object" ? g.name : g) || meta.genres,
+              };
+            } else {
+              meta = { ...meta, content_type: "tv" };
+            }
+          }
+
+          if (isTV && (meta.tmdb_id || meta.imdb_id)) {
+            const tmdbEps = await fetchTmdbEpisodes(meta.tmdb_id, meta.imdb_id);
+
+            if (tmdbEps.length > 0) {
+              // ── Figure out exactly which seasons+episode-counts DB has ──
+              // e.g. DB has Season 1 × 12 eps → only show S1E1–S1E12 from TMDB
+              const dbGrouped = {};
+              eps.forEach(dbEp => {
+                const s = String(dbEp.season || 1);
+                if (!dbGrouped[s]) dbGrouped[s] = [];
+                dbGrouped[s].push(dbEp);
+              });
+
+              // seasons present in DB (e.g. ["1"])
+              const dbSeasons = Object.keys(dbGrouped).map(Number);
+
+              // If DB has NO episodes at all, show all TMDB episodes
+              const hasDbEps = eps.length > 0;
+
+              // ── Build position-based lookup: S1E1 → db episode at index 0 ──
+              const dbBySeasonEp = {};
+              Object.entries(dbGrouped).forEach(([s, list]) => {
+                list.forEach((dbEp, idx) => {
+                  dbBySeasonEp[`${s}__${idx + 1}`] = dbEp;
+                });
+              });
+
+              // ── Exact episode-number lookup, for rows that carry one (the R2
+              //    uploader stamps `episode`). This beats position mapping when
+              //    episodes are uploaded out of order or with gaps — E01 then E03
+              //    must land on S×E1 and S×E3, not S×E1 and S×E2. Legacy rows
+              //    with no number fall through to the position/title lookups. ──
+              const dbEpNo = (dbEp) => {
+                const n = Number(dbEp?.episode ?? dbEp?.episode_number ?? dbEp?.episodeNumberInSeason);
+                return Number.isFinite(n) && n > 0 ? n : null;
+              };
+              const dbByExactEp = {};
+              const dbEpNumsBySeason = {};   // season → Set of explicit episode numbers
+              eps.forEach(dbEp => {
+                const n = dbEpNo(dbEp);
+                if (n == null) return;
+                const s = String(dbEp.season || 1);
+                dbByExactEp[`${s}__${n}`] = dbEp;
+                (dbEpNumsBySeason[s] || (dbEpNumsBySeason[s] = new Set())).add(n);
+              });
+
+              // ── Normalized title lookup as secondary match ──
+              const normalize = (str) =>
+                (str || "").toLowerCase().trim()
+                  .replace(/[^a-z0-9\s]/g, "")
+                  .replace(/\s+/g, " ");
+              const dbByTitle = {};
+              eps.forEach(dbEp => {
+                const key = `${dbEp.season || 1}__${normalize(dbEp.title)}`;
+                dbByTitle[key] = dbEp;
+              });
+
+              // ── Filter TMDB episodes to only seasons DB has uploaded ──
+              // AND only up to the episode count DB has for that season
+              const filteredTmdbEps = hasDbEps
+                ? tmdbEps.filter(tmdbEp => {
+                    const s = tmdbEp.season;
+                    if (!dbSeasons.includes(s)) return false; // season not uploaded
+                    // Season carries explicit numbers → show exactly those episodes.
+                    const nums = dbEpNumsBySeason[String(s)];
+                    if (nums && nums.size) return nums.has(tmdbEp.episodeNumberInSeason);
+                    // Legacy season (no numbers) → show up to the count DB has.
+                    const dbCountForSeason = dbGrouped[String(s)]?.length || 0;
+                    return tmdbEp.episodeNumberInSeason <= dbCountForSeason;
+                  })
+                : tmdbEps; // no DB eps → show everything from TMDB
+
+              // ── Merge: attach DB html/direct_url onto matching TMDB episode ──
+              eps = filteredTmdbEps.map(tmdbEp => {
+                const exactKey = `${tmdbEp.season}__${tmdbEp.episodeNumberInSeason}`;
+                const posKey   = `${tmdbEp.season}__${tmdbEp.episodeNumberInSeason}`;
+                const titleKey = `${tmdbEp.season}__${normalize(tmdbEp.title)}`;
+                const dbMatch  = dbByExactEp[exactKey] || dbBySeasonEp[posKey] || dbByTitle[titleKey] || null;
+
+                return {
+                  ...tmdbEp,
+                  html:       dbMatch?.html       || null,
+                  html_code:  dbMatch?.html       || null,
+                  direct_url: dbMatch?.direct_url || dbMatch?.hls_url || null,
+                  hasEmbed:   !!(dbMatch?.html),
+                  hasDirect:  !!(dbMatch?.direct_url || dbMatch?.hls_url),
+                };
+              });
+
+              meta = { ...meta, content_type: "tv" };
+            }
+          }
+
+          if (eps.length > 0 && meta.content_type !== "tv") {
+            meta = { ...meta, content_type: "tv" };
+          }
+
+          setMovieMeta(meta);
+          setTmdbMeta(tData);
+          setEpisodes(eps);
+          const srv = buildServers(meta, eps);
+          setAvailableServers(srv);
+          setActiveServer(srv[0] || null);
+          if (eps.length > 0) setActiveSeason(`S${eps[0]?.season || 1}`);
+        }
+      } catch (err) {
+        console.error("[WatchHtmlPage]", err);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    };
+
+    run();
+    return () => { alive = false; };
+  }, [routeSlug, backendUrl, fetchFullTmdb, fetchTmdbEpisodes, location.state]);
+
+  /* ── MX "no miss" — once a title loads (any path), check MX and, if found,
+       add MX Player to the list. It slots in at its normal priority (after
+       AnchorHD / Multi Audio / Omega), and only becomes the active server when
+       nothing better is already selected. ── */
+  useEffect(() => {
+    if (!movieMeta || movieMeta.mx_web_url || movieMeta.mx_id) return;
+    let alive = true;
+    (async () => {
+      const isTV = movieMeta.content_type === "tv" || episodes.length > 0;
+      const mx = await lookupMx(movieMeta.title, isTV);
+      if (!alive || !mx) return;
+      const meta2 = { ...movieMeta, mx_web_url: mx.webUrl, mx_id: mx.id, mx_type: mx.type };
+      setMovieMeta(meta2);
+      const srv2 = buildServers(meta2, episodes);
+      setAvailableServers(srv2);
+      // Keep whatever is already active (AnchorHD / Multi Audio) — only adopt the
+      // new top server when nothing was selected yet.
+      setActiveServer(prev => (prev && srv2.some(s => s.id === prev.id)) ? prev : srv2[0]);
+    })();
+    return () => { alive = false; };
+  }, [movieMeta?.title, movieMeta?.content_type, movieMeta?.mx_web_url, movieMeta?.mx_id, episodes.length]);
+
+  /* ── Loading ── */
+  if (loading) return (
+    <div className="min-h-screen bg-[#070709] flex flex-col items-center justify-center gap-6">
+      <div className="relative">
+        <div className="w-16 h-16 rounded-2xl bg-blue-600/10 border border-blue-500/20 flex items-center justify-center">
+          <Loader2 className="w-7 h-7 text-blue-500 animate-spin" />
+        </div>
+        <div className="absolute -inset-2 rounded-3xl border border-blue-500/10 animate-ping" />
+      </div>
+      <div className="space-y-1 text-center">
+        <p className="text-white font-black text-xs uppercase tracking-[0.3em]">Initializing</p>
+        <p className="text-gray-600 text-[10px] uppercase tracking-widest">Neural Link Active</p>
+      </div>
+    </div>
+  );
+
+  /* ── Not Found ── */
+  if (!movieMeta) return (
+    <div className="min-h-screen bg-[#070709] flex flex-col items-center justify-center gap-4 text-center px-4">
+      <AlertCircle className="w-12 h-12 text-red-500" />
+      <h2 className="text-white font-black text-xl uppercase tracking-widest">Content Not Found</h2>
+      <p className="text-gray-500 text-sm">This title is unavailable or was removed.</p>
+      <button onClick={() => navigate("/watch")}
+        className="mt-4 px-6 py-3 bg-blue-600 text-white font-black rounded-xl text-xs uppercase tracking-widest">
+        Back to Home
+      </button>
+    </div>
+  );
+
+  const isTVShow = movieMeta.content_type === "tv" || episodes.length > 0;
+
+  /* ══════════════════════════════════════════════════════════════════ */
+  return (
+    <div className="min-h-screen bg-[#070709] text-white pb-24 font-sans overflow-x-hidden">
+      {mxResolving && (
+        <div className="fixed inset-0 z-[9999] bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center gap-4">
+          <Loader2 className="animate-spin text-blue-500" size={40} />
+          <p className="text-sm text-white/70">Preparing MX Player stream…</p>
+        </div>
+      )}
+
+      {/* ── OVERLAY PLAYER ── */}
+      {showOverlay && (
+        <div
+          className="fixed inset-0 z-[1000] bg-[#070709] flex flex-col"
+          style={{
+            paddingTop: "env(safe-area-inset-top)",
+            paddingBottom: "env(safe-area-inset-bottom)",
+            height: "100dvh",
+          }}
+        >
+
+          {/* Top bar */}
+          <div className="flex items-center justify-between gap-2 px-3 sm:px-4 py-2.5 sm:py-3 bg-black/60 backdrop-blur-xl border-b border-white/[0.04] shrink-0 z-20">
+            <button onClick={closeOverlay}
+              aria-label="Close player and go back"
+              className="flex items-center gap-2 px-3 py-2.5 min-h-[44px] min-w-[44px] justify-center rounded-xl bg-white/5 hover:bg-white/10 active:bg-white/15 text-gray-400 hover:text-white transition-all border border-white/5 touch-manipulation">
+              <ArrowLeft size={17} />
+              <span className="text-xs font-bold hidden sm:inline tracking-wide">Back</span>
+            </button>
+            <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 justify-center">
+              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
+              <h2 className="text-white font-black text-[10px] sm:text-xs uppercase tracking-[0.1em] sm:tracking-[0.15em] truncate max-w-[40vw] sm:max-w-[35vw]">{movieMeta?.title || videoTitle}</h2>
+            </div>
+            <button onClick={() => setShowSettingsPanel(v => !v)}
+              aria-label="Toggle player settings"
+              className={`flex items-center gap-2 px-3 py-2.5 min-h-[44px] min-w-[44px] justify-center rounded-xl border transition-all text-xs font-bold tracking-wide touch-manipulation
+                ${showSettingsPanel ? "bg-blue-600/20 border-blue-500/40 text-blue-300" : "bg-white/5 border-white/5 text-gray-400 hover:text-white hover:border-white/20"}`}>
+              <Settings size={16} />
+              <span className="hidden sm:inline">Settings</span>
+            </button>
+          </div>
+
+          {/* Quick server bar */}
+          <div
+            className="px-3 sm:px-4 py-2 bg-black/40 backdrop-blur-md border-b border-white/[0.03] shrink-0 z-10 overflow-x-auto"
+            style={{ WebkitOverflowScrolling: "touch", scrollbarWidth: "none" }}
+          >
+            <div className="flex items-center gap-2 min-w-max">
+              <span className="text-[9px] text-gray-600 uppercase tracking-widest font-black shrink-0 mr-1">Server:</span>
+              {availableServers.map(s => (
+                <ServerBadge key={s.id} server={s} isActive={activeServer?.id === s.id}
+                  onClick={() => handleServerSwitch(s)} compact />
+              ))}
+            </div>
+          </div>
+
+          {/* Player + settings */}
+          <div className="flex flex-1 overflow-hidden relative min-h-0">
+            <div className={`flex-1 bg-black transition-all duration-300 relative ${showSettingsPanel ? "lg:mr-[320px]" : ""}`}>
+              {sourceType === "hls" ? (
+                 <VideoPlayer
+                   inline
+                   src={finalSource}
+                   title={movieMeta?.title || videoTitle}
+                   genres={movieMeta?.genres || []}
+                   logoUrl={movieMeta?.title_logo || tmdbMeta?.title_logo || ""}
+                   year={movieMeta?.year || ""}
+                   imdbRating={movieMeta?.imdbRating || "0.0"}
+                   poster={movieMeta?.poster || ""}
+                   backdrop={movieMeta?.background || movieMeta?.cover_poster || ""}
+                   description={movieMeta?.description || ""}
+                   episodes={movieMeta?.content_type === "tv" ? episodes : []}
+                   currentEpisodeIndex={currentEpIndex}
+                   onEpisodeClick={(ep) => playEpisodeStream(ep)}
+                   startTime={resumeStart}
+                   onProgress={handleProgress}
+                   preferredAudioLang={preferredAudioLang}
+                   onRefreshSource={refreshSource}
+                   onBackClick={closeOverlay}
+                 />
+               ) :
+               sourceType === "html"  ? <div className="w-full h-full" dangerouslySetInnerHTML={{ __html: finalSource }} /> :
+               sourceType === "video" ? (
+                 <video
+                   src={finalSource}
+                   controls
+                   autoPlay
+                   playsInline
+                   webkit-playsinline="true"
+                   preload="metadata"
+                   className="w-full h-full bg-black"
+                 />
+               ) : (
+                 <iframe
+                   src={finalSource}
+                   title={videoTitle}
+                   className="w-full h-full border-none"
+                   allowFullScreen
+                   webkitallowfullscreen="true"
+                   mozallowfullscreen="true"
+                   allow="autoplay; encrypted-media; fullscreen; picture-in-picture; clipboard-write"
+                   referrerPolicy="no-referrer-when-downgrade"
+                 />
+               )}
+            </div>
+
+            {/* Settings panel */}
+            <div
+              className={`absolute lg:relative top-0 right-0 h-full w-full sm:w-[340px] lg:w-[320px]
+              bg-[#0a0a0c] border-l border-white/[0.04] flex flex-col overflow-hidden
+              transition-transform duration-300 ease-in-out z-20
+              ${showSettingsPanel ? "translate-x-0" : "translate-x-full lg:translate-x-full"}`}
+              style={{ paddingBottom: showSettingsPanel ? "env(safe-area-inset-bottom)" : undefined }}
+            >
+
+              <div className="shrink-0 border-b border-white/[0.04]">
+                <div className="flex items-center justify-between px-4 sm:px-5 py-4">
+                  <div className="flex items-center gap-2">
+                    <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+                    <h3 className="text-white font-black text-xs uppercase tracking-[0.15em]">Player Settings</h3>
+                  </div>
+                  <button onClick={() => setShowSettingsPanel(false)}
+                    aria-label="Close settings panel"
+                    className="p-2.5 min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg hover:bg-white/5 active:bg-white/10 text-gray-600 hover:text-white transition-all touch-manipulation">
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="flex px-3 sm:px-5 gap-1 pb-3">
+                  {["servers","cast","settings"].map(tab => (
+                    <button key={tab} onClick={() => setActiveTab(tab)}
+                      className={`flex-1 py-2.5 min-h-[40px] rounded-lg text-[10px] font-black uppercase tracking-widest transition-all touch-manipulation
+                        ${activeTab === tab ? "bg-white/10 text-white border border-white/10" : "text-gray-600 hover:text-gray-400"}`}>
+                      {tab}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto" style={{ WebkitOverflowScrolling: "touch" }}>
+                {activeTab === "servers" && (
+                  <div className="p-4 space-y-2">
+                    <p className="text-[9px] font-black text-gray-600 uppercase tracking-[0.2em] px-1 mb-3">Available Servers</p>
+                    {availableServers.map(sv => (
+                      <ServerBadge key={sv.id} server={sv} isActive={activeServer?.id === sv.id} onClick={() => handleServerSwitch(sv)} />
+                    ))}
+                  </div>
+                )}
+
+                {activeTab === "cast" && (
+                  <div className="p-4 space-y-4">
+                    <p className="text-[9px] font-black text-gray-600 uppercase tracking-[0.2em] px-1">Starring Cast</p>
+                    {(tmdbMeta?.cast || []).length > 0 ? (
+                      <div className="grid grid-cols-3 gap-3">
+                        {tmdbMeta.cast.slice(0, 18).map((actor, i) => (
+                          <div key={i} className="group flex flex-col items-center gap-2 text-center">
+                            <div className="w-full aspect-square rounded-xl overflow-hidden border border-white/5 group-hover:border-blue-500/30 transition-all bg-white/5">
+                              <img
+                                src={actor.profile_path ? `https://image.tmdb.org/t/p/w185${actor.profile_path}` : "/default-avatar.jpg"}
+                                className="w-full h-full object-cover grayscale group-hover:grayscale-0 transition-all duration-500"
+                                alt={actor.name}
+                                onError={e => { e.target.onerror = null; e.target.src = "/default-avatar.jpg"; }}
+                              />
+                            </div>
+                            <span className="text-[9px] font-bold text-gray-500 group-hover:text-blue-400 transition-colors leading-tight line-clamp-2 uppercase tracking-tight">{actor.name}</span>
+                            {actor.character && <span className="text-[8px] text-gray-700 line-clamp-1 w-full">{actor.character}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-3 gap-3">
+                        {[...Array(9)].map((_,i) => (
+                          <div key={i} className="flex flex-col items-center gap-2 animate-pulse">
+                            <div className="w-full aspect-square rounded-xl bg-white/5 border border-white/5" />
+                            <div className="h-1.5 w-3/4 bg-white/5 rounded" />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {activeTab === "settings" && (
+                  <div className="p-4 space-y-4">
+                    <p className="text-[9px] font-black text-gray-600 uppercase tracking-[0.2em] px-1">Preferences</p>
+                    <div className="p-4 rounded-xl bg-blue-600/5 border border-blue-500/10">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-blue-600/10"><Eye size={14} className="text-blue-400" /></div>
+                        <div>
+                          <p className="text-[9px] text-gray-500 uppercase tracking-widest mb-0.5">Now Playing</p>
+                          <p className="text-xs font-bold text-white truncate max-w-[180px]">{videoTitle}</p>
+                        </div>
+                      </div>
+                    </div>
+                    {episodes.length > 0 && (
+                      <div className="rounded-xl border border-white/[0.04] overflow-hidden divide-y divide-white/[0.04]">
+                        <div className="flex items-start justify-between gap-4 px-4 py-4 bg-white/[0.01]">
+                          <div>
+                            <p className="text-xs font-bold text-white mb-1">Spoiler Protection</p>
+                            <p className="text-[10px] text-gray-600 leading-relaxed">Blur upcoming episodes</p>
+                          </div>
+                          <Toggle checked={spoilerProtection} onChange={setSpoilerProtection} />
+                        </div>
+                        <div className="flex items-start justify-between gap-4 px-4 py-4 bg-white/[0.01]">
+                          <div>
+                            <p className="text-xs font-bold text-white mb-1">Auto Next Episode</p>
+                            <p className="text-[10px] text-gray-600 leading-relaxed">Play next automatically</p>
+                          </div>
+                          <Toggle checked={autoNextEpisode} onChange={setAutoNextEpisode} />
+                        </div>
+                      </div>
+                    )}
+                    <div className="space-y-2">
+                      <p className="text-[9px] font-black text-gray-600 uppercase tracking-[0.2em] px-1">Stream Status</p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.04] flex items-center gap-2">
+                          <Signal size={12} className="text-green-400" /><span className="text-[10px] text-gray-400 font-bold">Connected</span>
+                        </div>
+                        <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.04] flex items-center gap-2">
+                          <Shield size={12} className="text-blue-400" /><span className="text-[10px] text-gray-400 font-bold">Secured</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {showSettingsPanel && (
+              <div className="absolute inset-0 bg-black/70 z-10 lg:hidden backdrop-blur-sm touch-manipulation" onClick={() => setShowSettingsPanel(false)} />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── NAVBAR ── */}
+      <header className="fixed top-0 inset-x-0 z-[110] h-16 flex items-center px-4">
+        <div className="absolute inset-0 bg-[#070709]/80 backdrop-blur-xl border-b border-white/[0.04]" />
+        <div className="relative max-w-7xl mx-auto w-full flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button onClick={() => navigate(-1)}
+              aria-label="Go back"
+              className="p-2.5 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl bg-white/5 hover:bg-white/10 active:bg-white/15 border border-white/5 hover:border-white/10 transition-all group touch-manipulation">
+              <ArrowLeft size={18} className="text-gray-400 group-hover:text-white transition-colors" />
+            </button>
+            <Link to="/"><img src="/logo_39.png" className="h-7" alt="logo" /></Link>
+          </div>
+          <div className="flex items-center gap-2 bg-white/5 border border-white/5 px-3 py-1.5 rounded-full">
+            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+            <span className="text-[9px] font-black text-gray-500 uppercase tracking-widest hidden sm:block">Global Source Active</span>
+          </div>
+        </div>
+      </header>
+
+      {/* ── HERO ── */}
+      <div className="relative pt-16 w-full min-h-[560px] overflow-hidden">
+        {movieMeta.background && (
+          <div className="absolute inset-0 z-0">
+            <img src={movieMeta.background} alt=""
+              className={`w-full h-full object-cover scale-110 transition-all duration-[2s] ${imgLoaded ? "opacity-25 scale-100" : "opacity-0 scale-110"}`}
+              onLoad={() => setImgLoaded(true)} />
+            <div className="absolute inset-0 bg-gradient-to-r from-[#070709] via-[#070709]/40 to-transparent" />
+            <div className="absolute inset-0 bg-gradient-to-t from-[#070709] via-[#070709]/30 to-transparent" />
+            <div className="absolute bottom-0 left-0 right-0 h-40 bg-gradient-to-t from-[#070709] to-transparent" />
+          </div>
+        )}
+
+        <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 py-12 flex flex-col lg:flex-row gap-10 lg:gap-14 items-start w-full">
+
+          {/* Poster */}
+          <div className="shrink-0 mx-auto lg:mx-0">
+            <div className="relative">
+              <div className="absolute -inset-4 bg-blue-600/10 rounded-[2rem] blur-2xl" />
+              <div className="relative w-[160px] sm:w-[200px] aspect-[2/3] rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-[0_32px_64px_rgba(0,0,0,0.8)]">
+                <img src={movieMeta.poster || "/default-poster.jpg"} className="w-full h-full object-cover" alt={movieMeta.title} />
+                <div className="absolute inset-0 bg-gradient-to-br from-white/5 via-transparent to-transparent pointer-events-none" />
+              </div>
+              <div className="absolute -bottom-3 -right-3 flex items-center gap-1 bg-[#070709] border border-white/10 px-2.5 py-1.5 rounded-xl shadow-xl">
+                <Star size={11} className="text-yellow-400" fill="currentColor" />
+                <span className="text-white font-black text-xs">{movieMeta.imdbRating || "0.0"}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Meta */}
+          <div className="flex-1 min-w-0 w-full space-y-5 lg:pt-6 text-center lg:text-left">
+
+            {/* Eyebrow */}
+            <div className="flex items-center justify-center lg:justify-start gap-2 flex-wrap">
+              {isTVShow
+                ? <><Tv2 size={12} className="text-blue-400"/><span className="text-blue-400 font-black text-[9px] uppercase tracking-[0.25em]">TV Series</span></>
+                : <><Film size={12} className="text-blue-400"/><span className="text-blue-400 font-black text-[9px] uppercase tracking-[0.25em]">Feature Film</span></>
+              }
+              {movieMeta.source === "tmdb" && (
+                <span className="px-2 py-0.5 bg-yellow-500/10 border border-yellow-500/20 rounded-md text-yellow-400 text-[8px] font-black uppercase tracking-widest">TMDB</span>
+              )}
+            </div>
+
+            {/* Title */}
+            {movieMeta.title_logo ? (
+              <img
+                src={movieMeta.title_logo}
+                alt={movieMeta.title || movieMeta.slug}
+                className="max-h-20 sm:max-h-28 lg:max-h-32 w-auto object-contain drop-shadow-2xl mb-1"
+                onError={(e) => { e.currentTarget.style.display = "none"; }}
+              />
+            ) : (
+              <h1 className="text-3xl sm:text-4xl lg:text-5xl xl:text-6xl font-black uppercase tracking-tighter italic text-white leading-[0.9] drop-shadow-2xl">
+                {movieMeta.title || movieMeta.slug}
+              </h1>
+            )}
+
+            {/* Tags */}
+            <div className="flex flex-wrap items-center justify-center lg:justify-start gap-2">
+              <span className="flex items-center gap-1.5 bg-blue-600 text-white text-[9px] font-black uppercase tracking-widest px-2.5 py-1.5 rounded-lg shadow-lg shadow-blue-600/30">
+                <ShieldCheck size={10}/> HD
+              </span>
+              {(movieMeta.runtime || tmdbMeta?.runtime) && (
+                <span className="flex items-center gap-1.5 text-gray-400 text-[9px] font-black uppercase tracking-widest bg-white/5 border border-white/5 px-2.5 py-1.5 rounded-lg">
+                  <Clock size={10} className="text-blue-400"/> {movieMeta.runtime || tmdbMeta.runtime} min
+                </span>
+              )}
+              {movieMeta.year && (
+                <span className="text-gray-400 text-[9px] font-black uppercase bg-white/5 border border-white/5 px-2.5 py-1.5 rounded-lg">
+                  {movieMeta.year}
+                </span>
+              )}
+              {movieMeta.certification && (
+                <span className="text-gray-400 text-[9px] font-black uppercase bg-white/5 border border-white/5 px-2.5 py-1.5 rounded-lg">
+                  {movieMeta.certification}
+                </span>
+              )}
+              {movieMeta.genres.slice(0,2).map((g,i) => (
+                <span key={i} className="text-gray-400 text-[9px] font-black uppercase bg-white/5 border border-white/5 px-2.5 py-1.5 rounded-lg">
+                  {typeof g === "object" ? g.name : g}
+                </span>
+              ))}
+            </div>
+
+            {/* Description */}
+            <p className="text-gray-300 text-sm leading-relaxed border-l-2 border-blue-600 pl-4 mx-auto lg:mx-0 text-left max-w-xl lg:max-w-none max-h-[120px] overflow-y-auto font-normal opacity-90">
+              {movieMeta.description}
+            </p>
+
+            {/* CTAs */}
+            <div className="flex flex-col sm:flex-row gap-3 pt-2 justify-center lg:justify-start">
+              <button
+                onClick={() => {
+                const firstEp = isTVShow && episodes.length > 0 ? episodes[0] : null;
+                // Respect the currently-selected server (e.g. AnchorHD). Only fall back
+                // to the embed mirror when the active server can't play this item.
+                handlePlayAction(firstEp);
+              }}
+                className="group relative overflow-hidden px-8 py-4 sm:py-3.5 min-h-[48px] bg-blue-600 text-white font-black rounded-xl flex items-center justify-center gap-3 shadow-xl shadow-blue-600/25 hover:shadow-blue-600/50 transition-all text-[10px] uppercase tracking-widest active:scale-[0.98] touch-manipulation">
+                <div className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/10 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700" />
+                <div className="relative p-1.5 bg-white/20 rounded-lg"><Play size={14} fill="currentColor"/></div>
+                <span className="relative">{isTVShow ? "Stream Now" : "Play Now"}</span>
+              </button>
+              {movieMeta.download_links?.length > 0 && (
+                <button onClick={() => document.getElementById("download-section")?.scrollIntoView({ behavior:"smooth" })}
+                  className="px-8 py-4 sm:py-3.5 min-h-[48px] bg-white/5 text-white border border-white/10 font-black rounded-xl flex items-center justify-center gap-3 hover:bg-white/10 hover:border-white/20 transition-all text-[10px] uppercase tracking-widest active:scale-[0.98] touch-manipulation">
+                  <Download size={15}/> Download
+                </button>
+              )}
+            </div>
+
+            {/* Quick server select */}
+            {availableServers.length > 0 && (
+              <div className="pt-2 scroll-mt-24" id="servers-section">
+                {/* Every server lives here now that the deployment grid is gone:
+                    one swipeable row on a phone, wrapping from sm up. */}
+                <p className="text-[9px] font-black text-gray-600 uppercase tracking-[0.2em] mb-2 text-center lg:text-left">Available Servers</p>
+                <div
+                  className="flex gap-2 justify-start lg:justify-start max-w-full overflow-x-auto sm:flex-wrap sm:overflow-visible -mx-1 px-1 scrollbar-hide"
+                  style={{ WebkitOverflowScrolling: "touch" }}
+                >
+                  {availableServers.map(sv => (
+                    <button key={sv.id}
+                      onClick={() => { setActiveServer(sv); handlePlayAction(currentOverlayEp, sv.id); }}
+                      className={`shrink-0 flex items-center gap-1.5 px-3.5 py-2.5 min-h-[40px] rounded-lg text-[9px] font-black uppercase tracking-wider border transition-all active:scale-95 touch-manipulation
+                        ${activeServer?.id === sv.id ? (SRV_COLOR[sv.id] || "text-blue-400 bg-blue-500/10 border-blue-500/30") : "text-gray-600 bg-white/[0.02] border-white/5 hover:text-gray-400 hover:border-white/10"}`}>
+                      <span className={`w-1 h-1 rounded-full ${activeServer?.id === sv.id ? "bg-current" : "bg-gray-700"}`}/>
+                      {sv.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Centered high-impression ad banner */}
+      <MbidadmBanner />
+
+      {/* ── MAIN CONTENT ── */}
+      <main className="relative max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-20 z-10">
+
+        {/* Continue Watching */}
+        {continueList.filter(r => r.slug !== movieMeta?.slug).length > 0 && (
+          <div className="space-y-6">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-blue-600/10 border border-blue-500/10"><Clock size={18} className="text-blue-400"/></div>
+              <h2 className="text-base font-black uppercase tracking-[0.15em] text-white">Continue Watching</h2>
+            </div>
+            <div className="flex gap-4 overflow-x-auto pb-2 -mx-1 px-1">
+              {continueList.filter(r => r.slug !== movieMeta?.slug).map((r) => {
+                const next = hasNextEpisode(r);
+                const minsLeft = Math.ceil(timeLeft(r) / 60);
+                const goPlay = () => resumeItem(next ? { ...r, season: r.next.season, episode: r.next.episode, time: 0 } : r);
+                return (
+                  <div key={r.slug} className="relative shrink-0 w-48 sm:w-56 cursor-pointer group" onClick={goPlay}>
+                    <div className="relative aspect-video rounded-xl overflow-hidden bg-gray-800 border border-white/10">
+                      <img src={r.backdrop || r.poster || "/default-cover.jpg"} alt={r.title} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" onError={(e) => { if (!e.currentTarget.src.endsWith("/default-cover.jpg")) e.currentTarget.src = "/default-cover.jpg"; }} />
+                      {r.logo && <img src={r.logo} alt="" className="absolute left-2.5 bottom-3 h-5 sm:h-6 max-w-[55%] object-contain drop-shadow pointer-events-none" onError={(e) => { e.currentTarget.style.display = "none"; }} />}
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/25 opacity-0 group-hover:opacity-100 transition-opacity">
+                        {next ? <span className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 text-white text-[10px] font-black uppercase"><Play size={12} fill="white"/> Next Episode</span> : <Play size={26} className="text-white" fill="white"/>}
+                      </div>
+                      <button onClick={(e) => { e.stopPropagation(); removeProgress(r.slug); loadContinue(); }} className="absolute top-1.5 right-1.5 p-1 rounded-full bg-black/60 text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"><X size={12}/></button>
+                      {!next && <div className="absolute bottom-0 inset-x-0 h-1 bg-white/15"><div className="h-full bg-blue-500" style={{ width: `${progressPercent(r)}%` }} /></div>}
+                    </div>
+                    <p className="mt-2 text-xs font-bold text-white truncate">{r.title || r.slug}</p>
+                    <p className="mt-0.5 text-[10px] font-black uppercase tracking-wider">
+                      {r.content_type === "tv" && r.episode && <span className="text-blue-400">S{r.season} · E{r.episode} </span>}
+                      {next ? <span className="text-green-400">· Up next E{r.next.episode}</span> : (minsLeft > 0 && <span className="text-gray-500">· {minsLeft}m left</span>)}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Episodes */}
+        {episodes.length > 0 && (
+          <div className="space-y-6 scroll-mt-24" id="episodes-section">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-blue-600/10 border border-blue-500/10"><List size={18} className="text-blue-400"/></div>
+              <div>
+                <h2 className="text-base font-black uppercase tracking-[0.15em] text-white">Episodes</h2>
+                <p className="text-[10px] text-gray-600 font-bold">{episodes.length} episodes available</p>
+              </div>
+            </div>
+
+            {/* Season tabs */}
+            <div className="flex gap-2 overflow-x-auto pb-1" style={{ WebkitOverflowScrolling: "touch" }}>
+              {Object.keys(groupedEpisodes).map(sk => (
+                <button key={sk} onClick={() => setActiveSeason(sk)}
+                  className={`shrink-0 px-5 py-2.5 min-h-[40px] rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border touch-manipulation
+                    ${activeSeason === sk ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-600/20" : "bg-white/[0.03] text-gray-500 border-white/5 hover:text-gray-300 hover:border-white/10"}`}>
+                  {groupedEpisodes[sk].name}
+                </button>
+              ))}
+            </div>
+
+            {/* Episode grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {groupedEpisodes[activeSeason]?.episodes?.map((ep, i) => (
+                <div key={i} className="relative">
+                  <div onClick={() => {
+                    if (openDropdown === i) { setOpenDropdown(null); return; }
+                    // Single-tap plays via the SELECTED server (AnchorHD → our stream);
+                    // only open the server menu if this episode has no playable source.
+                    if (ep.hasDirect || ep.hasEmbed) { handlePlayAction(ep); return; }
+                    setOpenDropdown(i);
+                  }}
+                    className={`group flex gap-4 p-4 rounded-2xl border transition-all cursor-pointer touch-manipulation active:scale-[0.99]
+                      ${openDropdown === i ? "bg-blue-600/5 border-blue-500/20" : "bg-white/[0.02] border-white/[0.04] hover:bg-white/[0.04] hover:border-white/10"}`}>
+                    <div className={`relative shrink-0 w-28 sm:w-36 aspect-video rounded-xl overflow-hidden bg-white/5 border border-white/5 flex items-center justify-center transition-all ${openDropdown === i ? "border-blue-500/30" : ""}`}>
+                      {(ep.thumbnail || ep.still_path) && (
+                        <img
+                          src={ep.thumbnail || (ep.still_path?.startsWith("http") ? ep.still_path : `https://image.tmdb.org/t/p/w300${ep.still_path}`)}
+                          alt={ep.title || ep.name || ""}
+                          className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity"
+                          onError={e => { e.target.style.display = "none"; }}
+                        />
+                      )}
+                      <div className={`relative z-10 p-2.5 rounded-xl transition-all
+                        ${openDropdown === i
+                          ? "bg-blue-600 text-white"
+                          : (ep.thumbnail || ep.still_path)
+                            ? "bg-black/50 backdrop-blur-sm text-white"
+                            : "bg-white/10 text-gray-400 group-hover:bg-white/20"}`}>
+                        <Play size={16} fill="currentColor"/>
+                      </div>
+                    </div>
+                    <div className="flex-1 min-w-0 flex flex-col justify-center">
+                      <p className="text-[9px] font-black uppercase text-blue-500 tracking-[0.15em] mb-1.5">S{ep.season} · E{ep.episodeNumberInSeason}</p>
+                      <h4 className="text-sm font-bold text-white truncate mb-1">{ep.title || ep.name || `Episode ${ep.episodeNumberInSeason}`}</h4>
+                      {ep.air_date && (
+                        <p className="text-[9px] text-gray-700 font-bold uppercase tracking-wider mb-1">
+                          {new Date(ep.air_date).toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" })}
+                        </p>
+                      )}
+                      {(ep.description || ep.overview) && <p className="text-[11px] text-gray-600 line-clamp-2 leading-relaxed">{ep.description || ep.overview}</p>}
+                    </div>
+                    <div className="shrink-0 self-center p-2 -m-2">
+                      <ChevronDown size={16} className={`text-gray-600 transition-transform ${openDropdown === i ? "rotate-180 text-blue-400" : ""}`}/>
+                    </div>
+                  </div>
+
+                  {openDropdown === i && (
+                    <div className="mt-2 p-3 rounded-2xl bg-[#0a0a0d] border border-white/[0.06] grid grid-cols-2 sm:grid-cols-4 gap-2">
+                     {[
+                        ...(movieMeta.mx_web_url || movieMeta.mx_id ? [{ id:"mx", label:"MX Player", color:"green" }] : []),
+                        { id:"imdb_reader", label:"Omega",      color:"yellow" },
+                        { id:"embed",       label:"Multi Audio", color:"indigo" },
+                        { id:"mirchi",      label:"Mirchi",      color:"rose"   },
+                        { id:"vidify",      label:"Vidify",     color:"purple" },
+                        { id:"videasy",     label:"VidEasy",    color:"blue"   },
+                        { id:"vidup",       label:"VidUp",      color:"cyan"   },
+                        { id:"tmdb",        label:"Alpha",      color:"blue"   },
+                        { id:"2embed",      label:"Prime",      color:"orange" },
+                        { id:"modiplay",    label:"Nova",       color:"pink"   },
+                      ].filter(srv => {
+                        // Hide embed server button if this episode has no html embed
+                        if (srv.id === "embed") return !!(ep.html || ep.html_code);
+                        return true;
+                      }).map(srv => {
+                        const cc = {
+                          green: "bg-green-500/10 text-green-400 border-green-500/20 hover:border-green-500/40 hover:bg-green-500/15",
+                          yellow:"bg-yellow-500/10 text-yellow-400 border-yellow-500/20 hover:border-yellow-500/40 hover:bg-yellow-500/15",
+                          indigo:"bg-indigo-500/10 text-indigo-400 border-indigo-500/20 hover:border-indigo-500/40 hover:bg-indigo-500/15",
+                          rose:  "bg-rose-500/10 text-rose-400 border-rose-500/20 hover:border-rose-500/40 hover:bg-rose-500/15",
+                          purple:"bg-purple-500/10 text-purple-400 border-purple-500/20 hover:border-purple-500/40 hover:bg-purple-500/15",
+                          blue:  "bg-blue-500/10 text-blue-400 border-blue-500/20 hover:border-blue-500/40 hover:bg-blue-500/15",
+                          cyan:  "bg-cyan-500/10 text-cyan-400 border-cyan-500/20 hover:border-cyan-500/40 hover:bg-cyan-500/15",
+                          orange:"bg-orange-500/10 text-orange-400 border-orange-500/20 hover:border-orange-500/40 hover:bg-orange-500/15",
+                          pink:  "bg-pink-500/10 text-pink-400 border-pink-500/20 hover:border-pink-500/40 hover:bg-pink-500/15",
+                        };
+                        return (
+                          <button key={srv.id} onClick={() => handlePlayAction(ep, srv.id)}
+                            className={`py-3 px-3 min-h-[44px] rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all active:scale-95 touch-manipulation ${cc[srv.color]}`}>
+                            {srv.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Top Cast ──
+             The genre/origin strip and the second copy of the server grid used
+             to sit here. Both were duplicates — genres and the release year are
+             already in the hero, and every server is one tap away in the strip
+             under the poster — so the space goes to the cast instead. */}
+        {(tmdbMeta?.cast || []).length > 0 && (
+          <div className="space-y-5">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-blue-600/10 border border-blue-500/10"><Users size={18} className="text-blue-400"/></div>
+              <div>
+                <h2 className="text-base font-black uppercase tracking-[0.15em] text-white">Top Cast</h2>
+                <p className="text-[10px] text-gray-600 font-bold">{tmdbMeta.cast.length} billed</p>
+              </div>
+            </div>
+
+            {/* One row that scrolls on a phone and wraps into a grid from sm up,
+                so the faces stay the same size instead of shrinking to fit. */}
+            <div
+              className="flex gap-3 overflow-x-auto pb-2 -mx-4 px-4 sm:mx-0 sm:px-0 sm:grid sm:grid-cols-4 lg:grid-cols-6 sm:gap-4 sm:overflow-visible scrollbar-hide"
+              style={{ WebkitOverflowScrolling: "touch" }}
+            >
+              {tmdbMeta.cast.slice(0, 12).map((actor, i) => (
+                <div key={i} className="group w-[104px] shrink-0 sm:w-auto">
+                  <div className="aspect-[2/3] rounded-2xl overflow-hidden bg-white/[0.03] border border-white/[0.06] group-hover:border-blue-500/30 transition-colors">
+                    <img
+                      src={actor.profile_url || (actor.profile_path ? `https://image.tmdb.org/t/p/w300${actor.profile_path}` : "/default-avatar.jpg")}
+                      alt={actor.name}
+                      loading="lazy"
+                      className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                      onError={e => { e.target.onerror = null; e.target.src = "/default-avatar.jpg"; }}
+                    />
+                  </div>
+                  <p className="mt-2.5 text-[11px] font-bold text-white leading-tight line-clamp-2">{actor.name}</p>
+                  {actor.character && (
+                    <p className="mt-0.5 text-[10px] text-gray-500 leading-tight line-clamp-1">{actor.character}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Downloads */}
+        {movieMeta.download_links?.length > 0 && (
+          <div id="download-section" className="space-y-5 scroll-mt-24">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-green-600/10 border border-green-500/10"><Database size={18} className="text-green-400"/></div>
+              <div>
+                <h2 className="text-base font-black uppercase tracking-[0.15em] text-white">Downloads</h2>
+                <p className="text-[10px] text-gray-600 font-bold">{movieMeta.download_links.length} quality options</p>
+              </div>
+            </div>
+            <div className="space-y-6">
+              {movieMeta.download_links.map((block, idx) => {
+                // Read what the file actually is from its name — resolution,
+                // source, codec, languages, audio, subs, size — for a clear view.
+                const meta = parseFileMeta(fileNameOf(block.links?.[0] || {}, block) + " " + (block.quality || ""));
+                const langCount = meta.languages.list.length;
+                const badge = "text-[10px] font-black uppercase tracking-wider px-2 py-1 rounded-md border";
+                return (
+                <div key={idx} className="space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0"/>
+                    {/* Lead with the block's own label — for a series it carries
+                        "S01 · Episodes" / "S01 · Full Season", which the parsed
+                        badges don't. Fall back to the parsed quality otherwise. */}
+                    <span className={`${badge} bg-green-500/10 text-green-400 border-green-500/20`}>{block.quality || meta.quality}</span>
+                    {meta.source && !/(web-?dl|hdrip|bluray|predvd|hdtc)/i.test(block.quality || "") &&
+                      <span className={`${badge} bg-blue-500/10 text-blue-400 border-blue-500/20`}>{meta.source}</span>}
+                    {meta.codec &&
+                      <span className={`${badge} bg-white/5 text-gray-400 border-white/10`}>{meta.codec}</span>}
+                    {langCount > 0 &&
+                      <span className={`${badge} bg-purple-500/10 text-purple-300 border-purple-500/20`}
+                            title={meta.languages.list.join(", ")}>
+                        {langCount === 1 ? meta.languages.list[0] : `${langCount} Languages`}
+                      </span>}
+                    {langCount === 0 && meta.languages.label &&
+                      <span className={`${badge} bg-purple-500/10 text-purple-300 border-purple-500/20`}>{meta.languages.label}</span>}
+                    {meta.audio &&
+                      <span className={`${badge} bg-white/5 text-gray-400 border-white/10`}>{meta.audio}</span>}
+                    {meta.subs &&
+                      <span className={`${badge} bg-white/5 text-gray-400 border-white/10`}>ESub</span>}
+                    <span className="ml-auto text-[10px] font-bold text-gray-600">{meta.size || block.size}</span>
+                  </div>
+                  {langCount > 1 && (
+                    <p className="text-[10px] text-gray-500 -mt-1 pl-3.5">{meta.languages.list.join(" · ")}</p>
+                  )}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
+                    {block.links?.map((link, i) => (
+                      /* rel is "noopener" WITHOUT "noreferrer": the Cloudflare worker
+                         checks the Referer and answers "Forbidden origin" without one,
+                         so noreferrer would 403 every download. noopener still stops the
+                         opened tab reaching back through window.opener. */
+                      <a key={i} href={(link.path && signedLinks[link.path]) || link.url} target="_blank" rel="noopener"
+                        // A path with no signature yet is not a working link — wait for it
+                        // rather than sending someone to a 403.
+                        aria-disabled={!!link.path && !signedLinks[link.path]}
+                        onClick={e => { if (link.path && !signedLinks[link.path]) e.preventDefault(); }}
+                        className="group p-4 min-h-[44px] rounded-xl bg-white/[0.02] border border-white/[0.04] hover:border-green-500/30 hover:bg-green-500/5 transition-all flex items-center gap-3 active:scale-[0.98] touch-manipulation">
+                        <div className="p-2 rounded-lg bg-green-500/10 text-green-400 group-hover:bg-green-500/20 transition-colors"><Download size={14}/></div>
+                        <p className="text-xs font-bold text-gray-300 group-hover:text-white transition-colors uppercase tracking-wide">{link.label}</p>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </main>
+
+      <div className="md:hidden fixed bottom-0 inset-x-0 z-[110]"><Navbar /></div>
+    </div>
+  );
+};
+
+export default WatchHtmlPage;
